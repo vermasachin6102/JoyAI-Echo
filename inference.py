@@ -96,6 +96,8 @@ class InferenceConfig:
         self.prompts_dir = str(_resolve_path(paths_cfg.get("prompts_dir", "prompts"), REPO_ROOT))
         self.prompts_glob = paths_cfg.get("prompts_glob", "*.json")
         self.output_root = str(_resolve_path(paths_cfg.get("output_root", "inference_result/dmd"), REPO_ROOT))
+        _seed = paths_cfg.get("seed_video", None)
+        self.seed_video = str(_resolve_path(_seed, REPO_ROOT)) if _seed else None
 
         # Video
         self.num_frames = video_cfg.get("num_frames", 241)
@@ -324,6 +326,76 @@ class InferenceEngine:
         self._move(self.audio_vae.decoder, self.device)
         self._move(self.audio_vae.vocoder, self.device)
 
+    def _seed_memory_from_video(
+        self,
+        seed_video_path: str,
+        memory_bank: "PairedAudioVideoMemoryBank",
+    ) -> None:
+        """Pre-populate memory_bank from an existing mp4 (e.g. a Veo 3 clip)."""
+        import torchaudio
+        from torchvision.io import read_video
+        from PIL import Image
+
+        cfg = self.cfg
+        path = Path(seed_video_path)
+        if not path.exists():
+            raise FileNotFoundError(f"seed_video not found: {path}")
+
+        print(f"[Engine] Seeding memory bank from {path}", flush=True)
+
+        # read_video: video (T, H, W, C) uint8; audio (C, samples) float
+        video_tensor, audio_tensor, meta = read_video(str(path), output_format="THWC", pts_unit="sec")
+        if audio_tensor.numel() == 0:
+            raise ValueError(
+                f"seed_video has no audio track: {path}. "
+                "Paired memory requires audio; re-export the clip with audio."
+            )
+        src_sr = int(meta.get("audio_fps", cfg.audio_memory_sample_rate))
+
+        waveform = PairedAudioVideoMemoryBank._normalize_waveform_channels(
+            audio_tensor.float()
+        )  # [2, samples]
+        if src_sr != cfg.audio_memory_sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform, src_sr, int(cfg.audio_memory_sample_rate)
+            )
+            src_sr = int(cfg.audio_memory_sample_rate)
+
+        # Encode audio — bring encoder to device briefly
+        self._move(self.audio_vae.encoder, self.device)
+        self._empty()
+        audio_latent = self.audio_vae.encode(waveform, sampling_rate=src_sr)  # [1, T, C]
+        self._move(self.audio_vae.encoder, "cpu")
+        self._empty()
+
+        # PIL frames, resized to generation resolution — frames_to_video_tensor
+        # hard-fails on any size mismatch at memory-encode time.
+        target_size = (int(cfg.video_width), int(cfg.video_height))
+        frames = []
+        for i in range(video_tensor.shape[0]):
+            img = Image.fromarray(video_tensor[i].numpy())
+            if img.size != target_size:
+                img = img.resize(target_size, Image.LANCZOS)
+            frames.append(img)
+
+        memory_bank.save_memory_slot(
+            frames,
+            audio_latent,
+            audio_window_size=int(cfg.audio_memory_window_size),
+            video_clip_num_frames=int(cfg.video_memory_clip_num_frames),
+            audio_waveform=waveform,
+            audio_sample_rate=int(cfg.audio_memory_sample_rate),
+            video_fps=float(cfg.video_fps),
+            audio_window_selection_mode=str(cfg.audio_memory_window_selection_mode),
+            video_frame_selection_mode=str(cfg.video_memory_frame_selection_mode),
+            audio_memory_mel_bins=int(cfg.audio_memory_mel_bins),
+            audio_memory_mel_hop_length=int(cfg.audio_memory_mel_hop_length),
+            audio_memory_n_fft=int(cfg.audio_memory_n_fft),
+            audio_memory_downsample_factor=int(cfg.audio_memory_downsample_factor),
+            audio_memory_is_causal=bool(cfg.audio_memory_is_causal),
+        )
+        print(f"[Engine] Memory bank seeded: {len(memory_bank)} entry(s)", flush=True)
+
     def run_prompt_file(
         self,
         prompts_file: Path,
@@ -364,6 +436,9 @@ class InferenceEngine:
             num_fix_frames=int(cfg.num_fix_frames),
         )
 
+        if cfg.seed_video:
+            self._seed_memory_from_video(cfg.seed_video, memory_bank)
+
         shot_paths: list[Path] = []
         shot_audios: list[torch.Tensor] = []
         metadata: dict[str, Any] = {
@@ -373,6 +448,7 @@ class InferenceEngine:
             "denoising_steps": [int(x) for x in cfg.denoising_steps],
             "denoising_sigmas": [float(x) for x in cfg.denoising_sigmas],
             "num_prompts": len(prompts),
+            "seed_video": cfg.seed_video,
             "save_mode": cfg.save_mode,
             "memory_max_size": cfg.memory_max_size,
             "num_fix_frames": cfg.num_fix_frames,
@@ -603,6 +679,7 @@ def parse_args():
     parser.add_argument("--memory-max-size", type=int, default=None)
     parser.add_argument("--num-fix-frames", type=int, default=None)
     parser.add_argument("--enable-audio-memory", type=str_to_bool, default=None)
+    parser.add_argument("--seed-video", type=str, default=None, help="Path to seed video (.mp4) for memory bank")
     return parser.parse_args()
 
 
@@ -625,6 +702,8 @@ def main() -> None:
         cli_overrides["prompts_glob"] = args.prompts_glob
     if args.output_root:
         cli_overrides["output_root"] = str(Path(args.output_root).expanduser().resolve())
+    if args.seed_video:
+        cli_overrides["seed_video"] = str(Path(args.seed_video).expanduser().resolve())
 
     cfg = InferenceConfig(config_path, **cli_overrides)
 
