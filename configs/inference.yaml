@@ -92,6 +92,13 @@ inference:
   device: cuda
   dtype: bfloat16
   v2a_grad_scale: 2.0
+  # torch.compile the generator. Safe/fast for single-shot runs (fixed shape
+  # across all 8 denoise steps). Turns counterproductive across multishot runs
+  # -- memory bank grows shot to shot, so shape changes each shot and the
+  # ~30-60s compile tax gets paid again and again. Off by default; flip on
+  # deliberately for a single-shot speed test.
+  compile_enabled: false
+  compile_mode: max-autotune-no-cudagraphs
 
 # ---------------------------------------------------------------------------
 # Video VAE decode tiling (opt-in perf experiment -- see inference.py)

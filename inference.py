@@ -140,6 +140,19 @@ class InferenceConfig:
         self.dtype = inference_cfg.get("dtype", "bfloat16")
         self.v2a_grad_scale = inference_cfg.get("v2a_grad_scale", 2.0)
 
+        # torch.compile the generator (opt-in perf experiment). Pays a one-time
+        # ~30-60s compile tax on the first denoise step (shows up as a step_time
+        # spike in the [BasePipeline]/[MemoryPipeline] logs), then every later
+        # call with the SAME input shape reuses the compiled kernels. Safe for a
+        # single-shot run (shape fixed across all 8 steps). Risky across a
+        # multishot run: the memory bank grows shot to shot, so memory_video's
+        # shape changes every shot -> recompile tax paid again each time. Also
+        # forces "no-cudagraphs" because the generator is moved cpu<->gpu every
+        # shot (_stage_for_denoise/_stage_for_decode), which breaks CUDA graphs'
+        # static-pointer assumption regardless of shape.
+        self.compile_enabled = bool(inference_cfg.get("compile_enabled", False))
+        self.compile_mode = inference_cfg.get("compile_mode", "max-autotune-no-cudagraphs")
+
         # Decode-phase tiling (opt-in perf experiment): splits the VAE video
         # decoder's single monolithic forward pass into smaller spatial/temporal
         # tiles blended back together, instead of one full-resolution call.
@@ -290,6 +303,14 @@ class InferenceEngine:
             f"{time.perf_counter() - gen_started:.1f}s",
             flush=True,
         )
+
+        if cfg.compile_enabled:
+            print(
+                f"[Stage 2] torch.compile(generator, mode={cfg.compile_mode!r}) enabled -- "
+                f"compiles lazily on the first denoise call (expect a step_time spike there).",
+                flush=True,
+            )
+            self.generator = torch.compile(self.generator, mode=cfg.compile_mode)
 
         # Load VAEs to CPU; we hot-swap encoder/decoders per phase to avoid
         # holding ~30GB generator and VAE decoders on GPU at the same time.
