@@ -6,6 +6,7 @@ in DMD training. It runs the generator through multiple denoising steps
 and returns the intermediate states.
 """
 
+import time
 from typing import Tuple, Dict, Any, Optional
 import torch
 import torch.nn as nn
@@ -189,6 +190,7 @@ class BidirectionalAVInferencePipeline:
 
         # Few-step denoising
         for i, sigma in enumerate(self.denoising_sigmas[:-1]):
+            _step_t0 = time.perf_counter()
             video_sigma = sigma * torch.ones([B, F_v], device=device)
             audio_sigma = sigma * torch.ones([B, F_a], device=device)
 
@@ -199,6 +201,13 @@ class BidirectionalAVInferencePipeline:
                 timestep=video_sigma,
                 noisy_audio=audio,
                 audio_timestep=audio_sigma,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            print(
+                f"[BasePipeline] denoise_step={i + 1}/{len(self.denoising_sigmas) - 1} "
+                f"sigma={float(sigma):.4f} step_time={time.perf_counter() - _step_t0:.3f}s",
+                flush=True,
             )
 
             # Get next sigma

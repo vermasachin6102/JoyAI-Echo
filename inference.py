@@ -300,31 +300,53 @@ class InferenceEngine:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
+    def _gpu_mem_str(self) -> str:
+        if self.device.type != "cuda":
+            return ""
+        alloc = torch.cuda.memory_allocated(self.device) / 1024**3
+        reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+        return f" gpu_alloc={alloc:.1f}GB gpu_reserved={reserved:.1f}GB"
+
+    def _log_stage(self, label: str, fn) -> None:
+        """Run a staging step, log wall time + GPU memory before/after (bottleneck probe)."""
+        t0 = time.perf_counter()
+        fn()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        print(f"[Stage-swap] {label} took {elapsed*1000:.0f}ms{self._gpu_mem_str()}", flush=True)
+
     def _stage_for_denoise(self) -> None:
         """Generator on GPU; all VAE pieces on CPU."""
-        self._move(self.video_vae.encoder, "cpu")
-        self._move(self.video_vae.decoder, "cpu")
-        self._move(self.audio_vae.encoder, "cpu")
-        self._move(self.audio_vae.decoder, "cpu")
-        self._move(self.audio_vae.vocoder, "cpu")
-        self._move(self.generator, self.device)
-        self._empty()
+        def _swap():
+            self._move(self.video_vae.encoder, "cpu")
+            self._move(self.video_vae.decoder, "cpu")
+            self._move(self.audio_vae.encoder, "cpu")
+            self._move(self.audio_vae.decoder, "cpu")
+            self._move(self.audio_vae.vocoder, "cpu")
+            self._move(self.generator, self.device)
+            self._empty()
+        self._log_stage("stage_for_denoise", _swap)
 
     def _stage_for_video_encode(self) -> None:
         """Add video VAE encoder onto GPU alongside the generator (brief use)."""
-        self._move(self.video_vae.encoder, self.device)
+        self._log_stage("stage_for_video_encode", lambda: self._move(self.video_vae.encoder, self.device))
 
     def _stage_after_video_encode(self) -> None:
-        self._move(self.video_vae.encoder, "cpu")
-        self._empty()
+        def _swap():
+            self._move(self.video_vae.encoder, "cpu")
+            self._empty()
+        self._log_stage("stage_after_video_encode", _swap)
 
     def _stage_for_decode(self) -> None:
         """Generator off GPU; VAE decoders + vocoder on GPU."""
-        self._move(self.generator, "cpu")
-        self._empty()
-        self._move(self.video_vae.decoder, self.device)
-        self._move(self.audio_vae.decoder, self.device)
-        self._move(self.audio_vae.vocoder, self.device)
+        def _swap():
+            self._move(self.generator, "cpu")
+            self._empty()
+            self._move(self.video_vae.decoder, self.device)
+            self._move(self.audio_vae.decoder, self.device)
+            self._move(self.audio_vae.vocoder, self.device)
+        self._log_stage("stage_for_decode", _swap)
 
     def _seed_memory_from_video(
         self,
@@ -506,6 +528,19 @@ class InferenceEngine:
                         memory_position_mode=str(cfg.memory_position_mode),
                     )
 
+                    _mem_audio_shape = (
+                        tuple(memory_audio_kwargs["memory_audio"].shape)
+                        if memory_audio_kwargs.get("memory_audio") is not None
+                        else None
+                    )
+                    print(
+                        f"[Engine] shot={shot_idx + 1} pipeline=memory_pipeline "
+                        f"memory_video_shape={tuple(memory_video.shape)} "
+                        f"memory_audio_shape={_mem_audio_shape} "
+                        f"(shape differs from prior shots -> torch.compile would recompile here)",
+                        flush=True,
+                    )
+
                     video_latent, audio_latent = self.memory_pipeline.generate(
                         video_shape=tuple(video_shape),
                         audio_shape=tuple(audio_shape),
@@ -515,6 +550,11 @@ class InferenceEngine:
                         **memory_audio_kwargs,
                     )
                 else:
+                    print(
+                        f"[Engine] shot={shot_idx + 1} pipeline=base_pipeline "
+                        f"(no memory yet, different call signature than memory_pipeline)",
+                        flush=True,
+                    )
                     video_latent, audio_latent = self.base_pipeline.generate(
                         video_shape=tuple(video_shape),
                         audio_shape=tuple(audio_shape),

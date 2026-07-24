@@ -4,6 +4,7 @@ Bidirectional pipelines for memory-conditioned DMD.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -369,6 +370,7 @@ class BidirectionalMemoryAVInferencePipeline:
         )
 
         for idx, sigma in enumerate(self.denoising_sigmas[:-1]):
+            _step_t0 = time.perf_counter()
             video_sigma = sigma * torch.ones([batch_size, num_video_frames], device=device, dtype=dtype)
             audio_sigma = sigma * torch.ones([batch_size, num_audio_frames], device=device, dtype=dtype)
 
@@ -385,6 +387,13 @@ class BidirectionalMemoryAVInferencePipeline:
             )
             pred_video = pred_video.to(dtype=dtype)
             pred_audio = pred_audio.to(dtype=dtype)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            print(
+                f"[MemoryPipeline] denoise_step={idx + 1}/{len(self.denoising_sigmas) - 1} "
+                f"sigma={float(sigma):.4f} step_time={time.perf_counter() - _step_t0:.3f}s",
+                flush=True,
+            )
 
             next_sigma = self.denoising_sigmas[idx + 1]
             if next_sigma > 0:
