@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -108,9 +109,21 @@ def encode_memory_frames_batch(
 
 @torch.no_grad()
 def decode_benchmark_sample(video_vae, audio_vae, video_latent, audio_latent):
-    video_pixel = video_vae.decode_to_pixel(video_latent)
-    audio_waveform = audio_vae.decode_to_waveform(audio_latent) if audio_latent is not None else None
+    _is_cuda = video_latent.is_cuda
 
+    _t0 = time.perf_counter()
+    video_pixel = video_vae.decode_to_pixel(video_latent)
+    if _is_cuda:
+        torch.cuda.synchronize()
+    print(f"[Decode] video_vae.decode_to_pixel took {time.perf_counter() - _t0:.2f}s", flush=True)
+
+    _t0 = time.perf_counter()
+    audio_waveform = audio_vae.decode_to_waveform(audio_latent) if audio_latent is not None else None
+    if _is_cuda:
+        torch.cuda.synchronize()
+    print(f"[Decode] audio_vae.decode_to_waveform took {time.perf_counter() - _t0:.2f}s", flush=True)
+
+    _t0 = time.perf_counter()
     video_uint8 = video_pixel[0]
     if video_uint8.shape[0] == 3:
         video_uint8 = video_uint8.permute(1, 0, 2, 3)
@@ -118,6 +131,7 @@ def decode_benchmark_sample(video_vae, audio_vae, video_latent, audio_latent):
     video_uint8 = (video_uint8.clamp(0, 1) * 255).cpu().to(torch.uint8).contiguous()
 
     audio_float = normalize_audio_waveform_for_media(audio_waveform)
+    print(f"[Decode] pixel/audio postprocess took {time.perf_counter() - _t0:.2f}s", flush=True)
     return video_uint8, audio_float
 
 
@@ -136,6 +150,7 @@ def write_benchmark_media(
     wrote_with_audio = False
     wrote_sidecar_wav = False
     if audio_waveform is not None:
+        _t0 = time.perf_counter()
         try:
             write_video(
                 str(output_path),
@@ -146,17 +161,30 @@ def write_benchmark_media(
                 audio_codec="aac",
             )
             wrote_with_audio = True
+            print(f"[Decode] write_video (with aac audio mux) took {time.perf_counter() - _t0:.2f}s", flush=True)
         except Exception as exc:
-            print(f"[warn] write_video with audio failed for {output_path}: {exc}; audio_stats={stats}", flush=True)
+            print(
+                f"[Decode] write_video with audio failed after {time.perf_counter() - _t0:.2f}s "
+                f"for {output_path}: {exc}; audio_stats={stats}",
+                flush=True,
+            )
 
     if not wrote_with_audio:
+        _t0 = time.perf_counter()
         write_video(str(output_path), video_uint8, fps=fps)
+        print(f"[Decode] write_video (video-only) took {time.perf_counter() - _t0:.2f}s", flush=True)
         if audio_waveform is not None:
+            _t0 = time.perf_counter()
             try:
                 torchaudio.save(str(output_path.with_suffix(".wav")), audio_waveform, audio_sr)
                 wrote_sidecar_wav = True
+                print(f"[Decode] torchaudio.save (sidecar wav) took {time.perf_counter() - _t0:.2f}s", flush=True)
             except Exception as exc:
-                print(f"[warn] torchaudio.save failed for {output_path}: {exc}; audio_stats={stats}", flush=True)
+                print(
+                    f"[Decode] torchaudio.save failed after {time.perf_counter() - _t0:.2f}s "
+                    f"for {output_path}: {exc}; audio_stats={stats}",
+                    flush=True,
+                )
 
     return {
         "wrote_audio_in_mp4": wrote_with_audio,
