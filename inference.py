@@ -235,6 +235,7 @@ class InferenceEngine:
     def load_generator(self) -> None:
         cfg = self.cfg
         print(f"[Stage 2] Loading generator + VAEs from {self._checkpoint}", flush=True)
+        stage2_started = time.perf_counter()
 
         loras: tuple[LoraPathStrengthAndSDOps, ...] = ()
         if cfg.memory_lora_path and cfg.memory_lora_generator:
@@ -246,6 +247,7 @@ class InferenceEngine:
                 ),
             )
 
+        gen_started = time.perf_counter()
         self.generator = create_ltx2_wrapper(
             checkpoint_path=str(self._checkpoint),
             gemma_path=str(self._gemma_path),
@@ -256,9 +258,15 @@ class InferenceEngine:
             loras=loras,
         )
         self.generator.eval()
+        print(
+            f"[Stage 2] create_ltx2_wrapper (checkpoint I/O + weight load) took "
+            f"{time.perf_counter() - gen_started:.1f}s",
+            flush=True,
+        )
 
         # Load VAEs to CPU; we hot-swap encoder/decoders per phase to avoid
         # holding ~30GB generator and VAE decoders on GPU at the same time.
+        vae_started = time.perf_counter()
         self.video_vae, self.audio_vae = create_vae_wrappers(
             checkpoint_path=str(self._checkpoint),
             device=torch.device("cpu"),
@@ -269,6 +277,7 @@ class InferenceEngine:
         )
         self.video_vae.eval()
         self.audio_vae.eval()
+        print(f"[Stage 2] create_vae_wrappers took {time.perf_counter() - vae_started:.1f}s", flush=True)
 
         denoising_sigmas = torch.tensor(list(cfg.denoising_sigmas), device=self.device, dtype=torch.float32)
         self.base_pipeline = BidirectionalAVInferencePipeline(
@@ -284,7 +293,10 @@ class InferenceEngine:
         )
 
         self.audio_sample_rate = self.audio_vae.get_output_sample_rate() or 24000
-        print(f"[Stage 2] Generator + VAEs ready.", flush=True)
+        print(
+            f"[Stage 2] Generator + VAEs ready. total_load_time={time.perf_counter() - stage2_started:.1f}s",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Module hot-swap helpers
