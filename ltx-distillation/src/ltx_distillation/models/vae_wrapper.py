@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from ltx_core.loader.registry import Registry
 from ltx_core.model.audio_vae import encode_audio
+from ltx_core.model.video_vae import TilingConfig
 from ltx_core.types import Audio
 
 
@@ -68,12 +69,15 @@ class VideoVAEWrapper(nn.Module):
         return self.encoder(video)
 
     @torch.no_grad()
-    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+    def decode(self, latent: torch.Tensor, tiling_config: Optional[TilingConfig] = None) -> torch.Tensor:
         """
         Decode latent to pixel space.
 
         Args:
             latent: Latent [B, F, C, H, W]
+            tiling_config: If given, decode in temporal/spatial tiles instead of
+                one monolithic forward pass (lower peak activation size, trades
+                some redundant compute at tile overlaps).
 
         Returns:
             Video [B, C, F_out, H_out, W_out] in range [-1, 1]
@@ -92,20 +96,25 @@ class VideoVAEWrapper(nn.Module):
         dec_device, dec_dtype = _module_device_dtype(self.decoder)
         latent = latent.to(device=dec_device, dtype=dec_dtype)
 
+        if tiling_config is not None:
+            chunks = list(self.decoder.tiled_decode(latent, tiling_config))
+            return torch.cat(chunks, dim=2)
+
         return self.decoder(latent)
 
     @torch.no_grad()
-    def decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
+    def decode_to_pixel(self, latent: torch.Tensor, tiling_config: Optional[TilingConfig] = None) -> torch.Tensor:
         """
         Decode latent to pixel video for visualization.
 
         Args:
             latent: Latent [B, F, C, H, W]
+            tiling_config: See `decode`.
 
         Returns:
             Video frames suitable for logging (normalized to [0, 1])
         """
-        video = self.decode(latent)
+        video = self.decode(latent, tiling_config=tiling_config)
         # Normalize from [-1, 1] to [0, 1]
         video = (video + 1) / 2
         video = video.clamp(0, 1)

@@ -13,6 +13,7 @@ import torchaudio
 from torchvision.io import write_video
 from torchvision.transforms import functional as TVF
 
+from ltx_core.model.video_vae import TilingConfig
 from ltx_distillation.inference.memory_multishot import (
     audio_waveform_stats,
     normalize_audio_waveform_for_media,
@@ -108,11 +109,13 @@ def encode_memory_frames_batch(
 
 
 @torch.no_grad()
-def decode_benchmark_sample(video_vae, audio_vae, video_latent, audio_latent):
+def decode_benchmark_sample(
+    video_vae, audio_vae, video_latent, audio_latent, tiling_config: Optional[TilingConfig] = None
+):
     _is_cuda = video_latent.is_cuda
 
     _t0 = time.perf_counter()
-    video_pixel = video_vae.decode_to_pixel(video_latent)
+    video_pixel = video_vae.decode_to_pixel(video_latent, tiling_config=tiling_config)
     if _is_cuda:
         torch.cuda.synchronize()
     print(f"[Decode] video_vae.decode_to_pixel took {time.perf_counter() - _t0:.2f}s", flush=True)

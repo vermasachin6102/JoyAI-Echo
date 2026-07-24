@@ -22,6 +22,7 @@ import torchaudio
 import yaml
 
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from ltx_distillation.inference.bidirectional_pipeline import BidirectionalAVInferencePipeline
 from ltx_distillation.inference.memory_bidirectional_pipeline import BidirectionalMemoryAVInferencePipeline
 from ltx_distillation.inference.memory_multishot import (
@@ -89,6 +90,7 @@ class InferenceConfig:
         memory_cfg = cfg.get("memory", {})
         audio_cfg = cfg.get("audio_memory", {})
         inference_cfg = cfg.get("inference", {})
+        decode_cfg = cfg.get("decode", {})
 
         # Paths
         self.checkpoint = str(_resolve_path(paths_cfg.get("checkpoint", "checkpoints/echo-longvideo-release.safetensors"), REPO_ROOT))
@@ -138,6 +140,18 @@ class InferenceConfig:
         self.dtype = inference_cfg.get("dtype", "bfloat16")
         self.v2a_grad_scale = inference_cfg.get("v2a_grad_scale", 2.0)
 
+        # Decode-phase tiling (opt-in perf experiment): splits the VAE video
+        # decoder's single monolithic forward pass into smaller spatial/temporal
+        # tiles blended back together, instead of one full-resolution call.
+        # Trades some redundant overlap compute for smaller peak activation size
+        # per call -- only a net win if the monolithic decode was memory/launch
+        # -bound rather than pure SM-compute-bound. Unverified, hence a toggle.
+        self.tiled_decode_enabled = bool(decode_cfg.get("tiled_decode_enabled", True))
+        self.tiled_decode_tile_size_frames = int(decode_cfg.get("tile_size_frames", 32))
+        self.tiled_decode_tile_overlap_frames = int(decode_cfg.get("tile_overlap_frames", 8))
+        self.tiled_decode_tile_size_px = int(decode_cfg.get("tile_size_px", 512))
+        self.tiled_decode_tile_overlap_px = int(decode_cfg.get("tile_overlap_px", 64))
+
         # Misc
         self.prompt_max_chars = None
 
@@ -181,6 +195,19 @@ class InferenceEngine:
         self.base_pipeline = None
         self.memory_pipeline = None
         self.audio_sample_rate: int | None = None
+
+        self.decode_tiling_config: TilingConfig | None = None
+        if cfg.tiled_decode_enabled:
+            self.decode_tiling_config = TilingConfig(
+                spatial_config=SpatialTilingConfig(
+                    tile_size_in_pixels=int(cfg.tiled_decode_tile_size_px),
+                    tile_overlap_in_pixels=int(cfg.tiled_decode_tile_overlap_px),
+                ),
+                temporal_config=TemporalTilingConfig(
+                    tile_size_in_frames=int(cfg.tiled_decode_tile_size_frames),
+                    tile_overlap_in_frames=int(cfg.tiled_decode_tile_overlap_frames),
+                ),
+            )
 
     # ------------------------------------------------------------------
     # Stage 1: encode prompts, then free text encoder
@@ -294,7 +321,13 @@ class InferenceEngine:
 
         self.audio_sample_rate = self.audio_vae.get_output_sample_rate() or 24000
         print(
-            f"[Stage 2] Generator + VAEs ready. total_load_time={time.perf_counter() - stage2_started:.1f}s",
+            f"[Stage 2] Generator + VAEs ready. total_load_time={time.perf_counter() - stage2_started:.1f}s "
+            f"tiled_decode={'ON' if self.decode_tiling_config else 'OFF'}"
+            + (
+                f" (tile_frames={cfg.tiled_decode_tile_size_frames}/{cfg.tiled_decode_tile_overlap_frames} "
+                f"tile_px={cfg.tiled_decode_tile_size_px}/{cfg.tiled_decode_tile_overlap_px})"
+                if self.decode_tiling_config else ""
+            ),
             flush=True,
         )
 
@@ -593,7 +626,8 @@ class InferenceEngine:
                 else None
             )
             video_uint8, audio_waveform = decode_benchmark_sample(
-                self.video_vae, self.audio_vae, video_latent, audio_latent
+                self.video_vae, self.audio_vae, video_latent, audio_latent,
+                tiling_config=self.decode_tiling_config,
             )
             if device.type == "cuda":
                 torch.cuda.synchronize()

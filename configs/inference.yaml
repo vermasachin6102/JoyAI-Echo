@@ -92,3 +92,15 @@ inference:
   device: cuda
   dtype: bfloat16
   v2a_grad_scale: 2.0
+
+# ---------------------------------------------------------------------------
+# Video VAE decode tiling (opt-in perf experiment -- see inference.py)
+# Splits the single monolithic decoder forward pass into smaller spatial/
+# temporal tiles blended back together, instead of one full-resolution call.
+# ---------------------------------------------------------------------------
+decode:
+  tiled_decode_enabled: true
+  tile_size_frames: 32
+  tile_overlap_frames: 8
+  tile_size_px: 512
+  tile_overlap_px: 64
