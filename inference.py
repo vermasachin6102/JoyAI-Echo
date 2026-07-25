@@ -152,6 +152,15 @@ class InferenceConfig:
         self.tiled_decode_tile_size_px = int(decode_cfg.get("tile_size_px", 512))
         self.tiled_decode_tile_overlap_px = int(decode_cfg.get("tile_overlap_px", 64))
 
+        # torch.compile on the video VAE decoder specifically (separate from the
+        # generator's compile_enabled above, and off by default -- unverified).
+        # Unlike the generator's transformer, the decoder's up_blocks are a
+        # plain nn.ModuleList with no per-layer `self.idx` guard, so it should
+        # not hit the same per-layer-recompile wall. Uses plain default compile
+        # mode (not max-autotune) to skip the expensive Triton kernel-search
+        # that caused the generator's compile to cost 154s instead of ~30-60s.
+        self.compile_video_decoder_enabled = bool(decode_cfg.get("compile_video_decoder_enabled", False))
+
         # Misc
         self.prompt_max_chars = None
 
@@ -305,6 +314,18 @@ class InferenceEngine:
         self.video_vae.eval()
         self.audio_vae.eval()
         print(f"[Stage 2] create_vae_wrappers took {time.perf_counter() - vae_started:.1f}s", flush=True)
+
+        if cfg.compile_video_decoder_enabled and self.video_vae.decoder is not None:
+            # Compile the bound `forward` method itself, not the module via
+            # torch.compile(module) -- tiled_decode() calls `self.forward(...)`
+            # directly (bypassing nn.Module.__call__), which a module-level
+            # torch.compile wrapper would silently never intercept.
+            print(
+                "[Stage 2] torch.compile(video_vae.decoder.forward, mode='default') enabled -- "
+                "compiles lazily on the first decode call.",
+                flush=True,
+            )
+            self.video_vae.decoder.forward = torch.compile(self.video_vae.decoder.forward)
 
         denoising_sigmas = torch.tensor(list(cfg.denoising_sigmas), device=self.device, dtype=torch.float32)
         self.base_pipeline = BidirectionalAVInferencePipeline(

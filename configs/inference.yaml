@@ -104,3 +104,6 @@ decode:
   tile_overlap_frames: 8
   tile_size_px: 512
   tile_overlap_px: 64
+  # torch.compile on the video VAE decoder only (separate from the reverted
+  # generator experiment). Cautious/off by default -- unverified payoff.
+  compile_video_decoder_enabled: false
