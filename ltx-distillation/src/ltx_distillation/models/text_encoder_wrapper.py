@@ -144,3 +144,45 @@ def create_text_encoder_wrapper(
     )
 
     return wrapper
+
+
+def create_text_encoder_wrapper_from_gguf(
+    gguf_path: str,
+    checkpoint_path: str,
+    gemma_root: str,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+    registry: Registry | None = None,
+) -> GemmaTextEncoderWrapper:
+    """Same as create_text_encoder_wrapper, but sources the Gemma LLM's
+    weights from a language-model-only GGUF file (e.g. Q4_0 quantized)
+    instead of the full bf16 safetensors checkpoint -- see
+    ltx_core.text_encoders.gemma.gguf_builder for scope and details.
+
+    embeddings_processor (video/audio connectors) is unaffected -- it's
+    built from the main LTX-2/JoyAI-Echo checkpoint, unrelated to gemma_root.
+    """
+    from ltx_core.text_encoders.gemma.gguf_builder import build_gemma_text_encoder_from_gguf
+    from ltx_pipelines.utils.model_ledger import ModelLedger
+
+    text_encoder = build_gemma_text_encoder_from_gguf(
+        gguf_path=gguf_path,
+        gemma_root=gemma_root,
+        device=device,
+        dtype=dtype,
+    )
+
+    ledger = ModelLedger(
+        dtype=dtype,
+        device=torch.device("cpu"),
+        checkpoint_path=checkpoint_path,
+        registry=registry,
+    )
+    embeddings_processor = ledger.gemma_embeddings_processor().to(device=device, dtype=dtype)
+
+    return GemmaTextEncoderWrapper(
+        text_encoder=text_encoder,
+        embeddings_processor=embeddings_processor,
+        device=device,
+        dtype=dtype,
+    )
