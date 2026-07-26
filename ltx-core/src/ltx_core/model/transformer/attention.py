@@ -120,11 +120,7 @@ def _log_xformers_dispatched_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tenso
         from xformers.ops.fmha import Inputs, dispatch
 
         inp = Inputs(query=q, key=k, value=v, attn_bias=mask, p=0.0)
-        # Private API (leading underscore) -- xformers doesn't expose a public
-        # way to ask "which op will you actually use". Name has moved between
-        # versions before (dispatch_fw vs _dispatch_fw); wrapped in try/except
-        # so an API change degrades to "unknown" instead of breaking inference.
-        op = dispatch._dispatch_fw(inp, needs_gradient=False)
+        op = dispatch.dispatch_fw(inp, needs_gradient=False)
         op_name = getattr(op, "NAME", getattr(op, "__name__", str(op)))
     except Exception as e:
         op_name = f"unknown (introspection error: {type(e).__name__}: {e})"
