@@ -25,22 +25,10 @@ class AttentionCallable(Protocol):
     ) -> torch.Tensor: ...
 
 
-_logged_pytorch_backend = False
-_logged_xformers_backend = False
-
-
 class PytorchAttention(AttentionCallable):
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        global _logged_pytorch_backend
-        if not _logged_pytorch_backend:
-            print(
-                "[Attention] backend=PytorchAttention (plain SDPA fallback -- xformers/FA3 not active)",
-                flush=True,
-            )
-            _logged_pytorch_backend = True
-
         b, _, dim_head = q.shape
         dim_head //= heads
         q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
@@ -98,38 +86,9 @@ class XFormersAttention(AttentionCallable):
             mask = mask_out[..., : mask.shape[-1]]
             mask = mask.expand(b, heads, -1, -1)
 
-        global _logged_xformers_backend
-        if not _logged_xformers_backend:
-            _log_xformers_dispatched_op(q.to(v.dtype), k.to(v.dtype), v, mask)
-            _logged_xformers_backend = True
-
         out = memory_efficient_attention(q.to(v.dtype), k.to(v.dtype), v, attn_bias=mask, p=0.0)
         out = out.reshape(b, -1, heads * dim_head)
         return out
-
-
-def _log_xformers_dispatched_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask) -> None:
-    """Log which xformers backend actually got picked for these real inputs --
-    e.g. cutlassF, fa2F, flshattF -- not just "xformers imported successfully".
-    Import succeeding says nothing about whether a working kernel exists for
-    this GPU/shape/dtype; this queries xformers' own dispatcher directly."""
-    import xformers
-
-    op_name = "unknown (dispatch introspection failed, see exception below)"
-    try:
-        from xformers.ops.fmha import Inputs, dispatch
-
-        inp = Inputs(query=q, key=k, value=v, attn_bias=mask, p=0.0)
-        op = dispatch.dispatch_fw(inp, needs_gradient=False)
-        op_name = getattr(op, "NAME", getattr(op, "__name__", str(op)))
-    except Exception as e:
-        op_name = f"unknown (introspection error: {type(e).__name__}: {e})"
-
-    print(
-        f"[Attention] backend=XFormersAttention xformers={xformers.__version__} "
-        f"dispatched_op={op_name} device={q.device} dtype={v.dtype}",
-        flush=True,
-    )
 
 
 class FlashAttention3(AttentionCallable):
