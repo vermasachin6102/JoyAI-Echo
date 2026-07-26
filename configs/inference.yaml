@@ -92,6 +92,10 @@ inference:
   device: cuda
   dtype: bfloat16
   v2a_grad_scale: 2.0
+  # FP8-quantize the generator transformer's weights on load. Off by default --
+  # changes numerical precision, unverified quality/speed impact on this model.
+  # Goal is VRAM reduction (opens cheaper GPU tiers), not necessarily speed.
+  quantization_fp8_enabled: false
 
 # ---------------------------------------------------------------------------
 # Video VAE decode tiling (opt-in perf experiment -- see inference.py)

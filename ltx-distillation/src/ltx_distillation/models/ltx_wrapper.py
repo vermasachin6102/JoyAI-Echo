@@ -31,6 +31,7 @@ from ltx_core.guidance.perturbations import (
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.transformer import LTXModel, X0Model
+from ltx_core.quantization import QuantizationPolicy
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.types import (
     AudioLatentShape,
@@ -784,6 +785,7 @@ def create_ltx2_wrapper(
     video_width: int = 768,
     loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
     registry: Registry | None = None,
+    quantization: QuantizationPolicy | None = None,
 ) -> LTX2DiffusionWrapper:
     """
     Factory function to create LTX2DiffusionWrapper from checkpoint.
@@ -795,6 +797,8 @@ def create_ltx2_wrapper(
         dtype: Model dtype
         video_height: Video height
         video_width: Video width
+        quantization: Optional QuantizationPolicy (e.g. QuantizationPolicy.fp8_cast())
+            to downcast transformer weights on load. None means full precision.
 
     Returns:
         Configured LTX2DiffusionWrapper
@@ -811,6 +815,7 @@ def create_ltx2_wrapper(
         gemma_root_path=gemma_path,
         loras=loras,
         registry=registry,
+        quantization=quantization,
     )
 
     # Get X0Model (wraps velocity model)

@@ -23,6 +23,7 @@ import yaml
 
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
+from ltx_core.quantization import QuantizationPolicy
 from ltx_distillation.inference.bidirectional_pipeline import BidirectionalAVInferencePipeline
 from ltx_distillation.inference.memory_bidirectional_pipeline import BidirectionalMemoryAVInferencePipeline
 from ltx_distillation.inference.memory_multishot import (
@@ -139,6 +140,14 @@ class InferenceConfig:
         self.device = inference_cfg.get("device", "cuda")
         self.dtype = inference_cfg.get("dtype", "bfloat16")
         self.v2a_grad_scale = inference_cfg.get("v2a_grad_scale", 2.0)
+
+        # FP8 quantization of the generator transformer (opt-in). Downcasts the
+        # existing bf16 checkpoint's linear weights to FP8 on load -- roughly
+        # halves the generator's VRAM footprint (measured peak ~36.5GB bf16),
+        # opening up cheaper GPU tiers (e.g. 24GB-class). Off by default:
+        # changes numerical precision, unverified quality/speed impact on this
+        # model, needs a real test run before trusting it.
+        self.quantization_fp8_enabled = bool(inference_cfg.get("quantization_fp8_enabled", False))
 
         # Decode-phase tiling (opt-in perf experiment): splits the VAE video
         # decoder's single monolithic forward pass into smaller spatial/temporal
@@ -274,6 +283,10 @@ class InferenceEngine:
                 ),
             )
 
+        quantization = QuantizationPolicy.fp8_cast() if cfg.quantization_fp8_enabled else None
+        if quantization is not None:
+            print("[Stage 2] FP8 quantization enabled (QuantizationPolicy.fp8_cast())", flush=True)
+
         gen_started = time.perf_counter()
         self.generator = create_ltx2_wrapper(
             checkpoint_path=str(self._checkpoint),
@@ -283,6 +296,7 @@ class InferenceEngine:
             video_height=int(cfg.video_height),
             video_width=int(cfg.video_width),
             loras=loras,
+            quantization=quantization,
         )
         self.generator.eval()
         print(
