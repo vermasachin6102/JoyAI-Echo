@@ -299,6 +299,18 @@ class InferenceEngine:
             quantization=quantization,
         )
         self.generator.eval()
+        if quantization is not None:
+            # Verify the downcast actually touched real tensors -- GPU memory
+            # numbers alone are ambiguous (upcast-during-inference temp buffers
+            # can mask whether stored weights actually shrank). Direct dtype
+            # count is unambiguous: it answers whether fp8_cast's SDOps key
+            # patterns matched anything in this specific checkpoint at all.
+            from collections import Counter
+
+            dtype_counts: Counter = Counter()
+            for p in self.generator.parameters():
+                dtype_counts[str(p.dtype)] += p.numel()
+            print(f"[Stage 2] generator param element counts by dtype: {dict(dtype_counts)}", flush=True)
         print(
             f"[Stage 2] create_ltx2_wrapper (checkpoint I/O + weight load) took "
             f"{time.perf_counter() - gen_started:.1f}s",
