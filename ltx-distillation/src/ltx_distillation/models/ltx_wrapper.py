@@ -821,8 +821,16 @@ def create_ltx2_wrapper(
     # Get X0Model (wraps velocity model)
     x0_model = ledger.transformer()
 
-    # Move to target device
-    x0_model = x0_model.to(device=device, dtype=dtype)
+    # Move to target device. When quantization is active, skip the blanket
+    # dtype cast -- `.to(dtype=dtype)` would immediately convert every
+    # freshly-downcast fp8 tensor straight back to `dtype` (bf16), silently
+    # undoing the quantization before this function even returns. Confirmed:
+    # a real test run showed 0% fp8 params post-load purely because of this
+    # line, even though the quantization SDOps key patterns matched fine.
+    if quantization is not None:
+        x0_model = x0_model.to(device=device)
+    else:
+        x0_model = x0_model.to(device=device, dtype=dtype)
 
     wrapper = LTX2DiffusionWrapper(
         model=x0_model,
