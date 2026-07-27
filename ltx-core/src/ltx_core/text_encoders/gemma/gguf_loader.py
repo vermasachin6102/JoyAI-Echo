@@ -21,7 +21,21 @@ from __future__ import annotations
 import gguf
 import torch
 
+from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
+
 LANGUAGE_MODEL_PREFIX = "model.model.language_model."
+EMBED_TOKENS_KEY = f"{LANGUAGE_MODEL_PREFIX}embed_tokens.weight"
+
+# GGUF's token_embd.weight has 262144 rows (pure text vocabulary) while our
+# Gemma3TextConfig.vocab_size is 262208 -- the extra 64 rows are reserved for
+# multimodal special tokens (config.image_token_index == 262144, i.e. right
+# at this exact boundary). Verified against a real download: llama.cpp's
+# conversion excludes these reserved rows since this is the language-model
+# -only GGUF (no vision). Safe to zero-pad: GemmaTextEncoder.encode() only
+# ever processes plain text token ids from the tokenizer, which never
+# include image_token_index or other reserved ids beyond the base text
+# vocabulary, so these padding rows are never looked up at runtime.
+_TARGET_VOCAB_SIZE = GEMMA3_CONFIG_FOR_LTX.text_config.vocab_size
 
 # GGUF tensor-name suffix (after "blk.N.") -> HF Gemma3 decoder-layer attribute path.
 _PER_LAYER_MAP = {
@@ -100,7 +114,14 @@ def load_gemma_gguf_state_dict(gguf_path: str, dtype: torch.dtype = torch.bfloat
             true_shape = tuple(int(d) for d in tensor.shape)
         dequantized = dequantized.reshape(true_shape)
 
-        state_dict[final_key] = torch.from_numpy(dequantized.copy()).to(dtype=dtype)
+        tensor_out = torch.from_numpy(dequantized.copy()).to(dtype=dtype)
+
+        if final_key == EMBED_TOKENS_KEY and tensor_out.shape[0] < _TARGET_VOCAB_SIZE:
+            pad_rows = _TARGET_VOCAB_SIZE - tensor_out.shape[0]
+            padding = torch.zeros((pad_rows, tensor_out.shape[1]), dtype=tensor_out.dtype)
+            tensor_out = torch.cat([tensor_out, padding], dim=0)
+
+        state_dict[final_key] = tensor_out
 
     if unmapped:
         # Expected count here is zero -- this file only contains language
