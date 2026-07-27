@@ -5,7 +5,16 @@ checkpoint. See gguf_loader.py for tensor-format details and scope.
 Motivation: the full bf16 Gemma-3-12B checkpoint (~24GB, including vision
 tower + lm_head we never use) doesn't fit on 24GB-class GPUs like L4 --
 confirmed OOM at ~22GB used, failing on the last ~30MB. A Q4_0 GGUF of just
-the language-model backbone is ~6.9GB, which does fit.
+the language-model backbone is ~6.9GB on disk, but gguf_loader.py
+dequantizes every tensor to bf16 in RAM (needed because plain nn.Linear
+can't run matmul against packed Q4_0 data) -- so the state dict handed to
+load_state_dict is already back up to ~24GB, same OOM as the full
+checkpoint. To actually keep the GPU footprint down, decoder Linear layers
+are requantized to bitsandbytes NF4 one layer at a time as they're moved to
+GPU below, so at most one layer's bf16 copy exists at once instead of all
+48 simultaneously. Note NF4 is a different scheme than the GGUF's
+QAT-trained Q4_0 -- this trades away that QAT-specific quality benefit for
+actually fitting in 22GB.
 """
 
 from __future__ import annotations
@@ -21,6 +30,33 @@ from ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
     GemmaTextEncoderConfigurator,
 )
 from ltx_core.text_encoders.gemma.gguf_loader import load_gemma_gguf_state_dict
+
+
+def _quantize_linears_to_gpu(module: torch.nn.Module, device: torch.device) -> None:
+    """Replace every nn.Linear under `module` with a bitsandbytes NF4 Linear4bit,
+    quantizing and moving to `device` one layer at a time. Doing this per-layer
+    (instead of moving the whole bf16 model to GPU first) keeps peak GPU memory
+    to ~one layer's worth instead of all 48 layers at once."""
+    import bitsandbytes as bnb
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, torch.nn.Linear):
+            quantized = bnb.nn.Linear4bit(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                compute_dtype=torch.bfloat16,
+                quant_type="nf4",
+            )
+            quantized.weight = bnb.nn.Params4bit(
+                child.weight.data, requires_grad=False, quant_type="nf4"
+            )
+            if child.bias is not None:
+                quantized.bias = torch.nn.Parameter(child.bias.data)
+            quantized.to(device)  # triggers the actual NF4 quantization
+            setattr(module, name, quantized)
+        else:
+            _quantize_linears_to_gpu(child, device)
 
 
 def build_gemma_text_encoder_from_gguf(
@@ -80,6 +116,16 @@ def build_gemma_text_encoder_from_gguf(
             f"(first 5): {leftover_meta[:5]}"
         )
 
+    # Quantize decoder Linear layers to GPU one at a time BEFORE the blanket
+    # move below -- doing it after would first stage all 48 layers as bf16
+    # on GPU (~24GB), which is the exact OOM this is meant to avoid.
+    _quantize_linears_to_gpu(inner.model.language_model, device)
+
+    # Remaining params (embed_tokens, norms, rotary buffers) are small
+    # (~2GB) and untouched by the loop above -- plain device/dtype move.
+    # bitsandbytes' Linear4bit safely no-ops on repeated .to() calls, so
+    # this is safe to run over the whole model including already-quantized
+    # layers.
     text_encoder = text_encoder.to(device=device, dtype=dtype)
 
     for module_op in module_ops_from_gemma_root(gemma_root):
