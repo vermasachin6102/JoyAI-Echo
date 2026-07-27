@@ -14,9 +14,18 @@ this loader does not use).
 
 Mapping and shape-reversal rule below were verified against a real download
 of google/gemma-3-12b-it-qat-q4_0-gguf, not inferred from documentation alone.
+
+Tensors are yielded one at a time (not collected into a dict) -- the full
+language-model backbone dequantized to bf16 is ~24GB, which alone can push a
+Colab-class instance's system RAM over the edge before anything even reaches
+the GPU. Streaming lets the caller quantize/move each tensor to GPU and drop
+the CPU copy before dequantizing the next one, keeping peak CPU RAM to
+roughly one tensor's size.
 """
 
 from __future__ import annotations
+
+from collections.abc import Iterator
 
 import gguf
 import torch
@@ -91,13 +100,12 @@ def _tensor_base_name(gguf_name: str) -> str:
     return gguf_name.removesuffix(".weight")
 
 
-def load_gemma_gguf_state_dict(gguf_path: str, dtype: torch.dtype = torch.bfloat16) -> dict[str, torch.Tensor]:
-    """Read a language-model-only Gemma3 GGUF file and return a state dict
-    with keys matching Gemma3ForConditionalGeneration's expected naming.
-    See module docstring for scope (language backbone only)."""
+def iter_gemma_gguf_tensors(gguf_path: str, dtype: torch.dtype = torch.bfloat16) -> Iterator[tuple[str, torch.Tensor]]:
+    """Read a language-model-only Gemma3 GGUF file, dequantizing and yielding
+    one (final_key, tensor) pair at a time -- see module docstring for scope
+    and why this streams instead of returning a full state dict."""
     reader = gguf.GGUFReader(gguf_path)
 
-    state_dict: dict[str, torch.Tensor] = {}
     unmapped: list[str] = []
 
     for tensor in reader.tensors:
@@ -121,7 +129,7 @@ def load_gemma_gguf_state_dict(gguf_path: str, dtype: torch.dtype = torch.bfloat
             padding = torch.zeros((pad_rows, tensor_out.shape[1]), dtype=tensor_out.dtype)
             tensor_out = torch.cat([tensor_out, padding], dim=0)
 
-        state_dict[final_key] = tensor_out
+        yield final_key, tensor_out
 
     if unmapped:
         # Expected count here is zero -- this file only contains language
@@ -130,5 +138,3 @@ def load_gemma_gguf_state_dict(gguf_path: str, dtype: torch.dtype = torch.bfloat
         # gap in the mapping table; surface it instead of silently
         # dropping weight data.
         raise ValueError(f"{len(unmapped)} GGUF tensors had no key mapping (first 5): {unmapped[:5]}")
-
-    return state_dict
