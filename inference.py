@@ -160,6 +160,14 @@ class InferenceConfig:
         # model, needs a real test run before trusting it.
         self.quantization_fp8_enabled = bool(inference_cfg.get("quantization_fp8_enabled", False))
 
+        # Stream transformer blocks to GPU one at a time instead of keeping all
+        # of them resident (see ltx_core.model.transformer.sequential_offload).
+        # Frees ~17GB of the generator's ~18.1GB fp8 footprint for activations,
+        # which is what actually OOMs on 24GB-class GPUs. Costs one H2D copy per
+        # block per forward pass -- ~3% at 58k tokens, but proportionally much
+        # worse on small videos, so leave it off unless VRAM demands it.
+        self.sequential_offload_enabled = bool(inference_cfg.get("sequential_offload_enabled", False))
+
         # Decode-phase tiling (opt-in perf experiment): splits the VAE video
         # decoder's single monolithic forward pass into smaller spatial/temporal
         # tiles blended back together, instead of one full-resolution call.
@@ -349,6 +357,21 @@ class InferenceEngine:
             for p in self.generator.parameters():
                 dtype_counts[str(p.dtype)] += p.numel()
             print(f"[Stage 2] generator param element counts by dtype: {dict(dtype_counts)}", flush=True)
+
+        if cfg.sequential_offload_enabled:
+            # Install after the generator is fully built and on device: the hooks
+            # move blocks off GPU, so anything that later did a blanket .to(device)
+            # would silently undo it (the exact failure mode fp8 hit in 68fff21).
+            from ltx_core.model.transformer.sequential_offload import install_sequential_offload
+
+            n_blocks = install_sequential_offload(self.generator, self.device)
+            if self.device.type == "cuda":
+                resident = torch.cuda.memory_allocated() / 1024**3
+                print(
+                    f"[Stage 2] Sequential offload ON: {n_blocks} blocks streamed from CPU, "
+                    f"{resident:.1f}GB still resident on GPU",
+                    flush=True,
+                )
         print(
             f"[Stage 2] create_ltx2_wrapper (checkpoint I/O + weight load) took "
             f"{time.perf_counter() - gen_started:.1f}s",
@@ -838,6 +861,10 @@ def parse_args():
         "--quantization-fp8-enabled", type=str_to_bool, default=None,
         help="FP8-downcast the generator's linear weights (stage 2). Roughly halves its ~36.5GB bf16 footprint.",
     )
+    parser.add_argument(
+        "--sequential-offload-enabled", type=str_to_bool, default=None,
+        help="Stream transformer blocks CPU->GPU one at a time, freeing ~17GB of weights for activations.",
+    )
     return parser.parse_args()
 
 
@@ -851,7 +878,7 @@ def main() -> None:
     cli_overrides = {}
     for key in ["seed", "num_frames", "video_height", "video_width", "video_fps",
                 "v2a_grad_scale", "memory_max_size", "num_fix_frames", "enable_audio_memory",
-                "quantization_fp8_enabled"]:
+                "quantization_fp8_enabled", "sequential_offload_enabled"]:
         val = getattr(args, key, None)
         if val is not None:
             cli_overrides[key] = val

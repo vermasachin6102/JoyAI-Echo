@@ -104,6 +104,17 @@ inference:
   # Goal is VRAM reduction (opens cheaper GPU tiers), not necessarily speed.
   quantization_fp8_enabled: false
 
+  # Stream transformer blocks CPU->GPU one at a time instead of keeping all 48
+  # resident. The generator's weights and its activations compete for the same
+  # VRAM: at ~18.1GB fp8 on a 22GB card only ~2.3GB is left, and the AdaLN
+  # projection alone needs tokens*9*4096*2 bytes (3.98GB at 497 frames /
+  # 736x1280). This drops block residency to ~1/48th, freeing ~17GB.
+  # Cost is one H2D copy per block per forward pass: a constant ~40-65ms per
+  # block against per-block compute that scales with token count -- ~3%
+  # overhead at 58k tokens, but >100% below ~3k tokens. Enable only when VRAM
+  # actually forces it; small videos are transfer-bound and fit anyway.
+  sequential_offload_enabled: false
+
 # ---------------------------------------------------------------------------
 # Video VAE decode tiling (opt-in perf experiment -- see inference.py)
 # Splits the single monolithic decoder forward pass into smaller spatial/
