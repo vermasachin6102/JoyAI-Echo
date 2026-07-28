@@ -42,6 +42,30 @@ def _find_transformer_blocks(model: torch.nn.Module) -> torch.nn.ModuleList:
     )
 
 
+def move_excluding_blocks(model: torch.nn.Module, device: torch.device) -> None:
+    """Move every part of `model` to `device` EXCEPT the transformer blocks.
+
+    Needed anywhere the caller does a blanket `model.to(device)` after
+    install_sequential_offload() -- a plain `.to()` recurses into every
+    registered submodule, including the offloaded blocks, and drags them all
+    back onto GPU at once (undoing the offload before any per-block hook gets
+    a chance to run). This is the same failure shape fp8 hit in 68fff21: a
+    later blanket move silently reversing an earlier targeted one.
+
+    Works by finding the block list's parent module, detaching the
+    'transformer_blocks' attribute so nn.Module.to() can't see it, moving
+    everything else, then reattaching. The blocks themselves are left
+    untouched (wherever install_sequential_offload put them -- CPU)."""
+    blocks = _find_transformer_blocks(model)
+    parent = next(m for m in model.modules() if getattr(m, "transformer_blocks", None) is blocks)
+
+    delattr(parent, "transformer_blocks")
+    try:
+        model.to(device)
+    finally:
+        parent.transformer_blocks = blocks
+
+
 def install_sequential_offload(model: torch.nn.Module, device: torch.device) -> int:
     """Move every transformer block to CPU and register hooks that bring each
     one to `device` for its forward pass and return it to CPU afterwards.

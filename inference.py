@@ -215,6 +215,9 @@ class InferenceEngine:
             raise FileNotFoundError(f"Gemma path not found: {gemma_path}")
         self._checkpoint = checkpoint
         self._gemma_path = gemma_path
+        # Read once here so _stage_for_denoise knows whether generator.to(device)
+        # would drag offloaded blocks back onto GPU and needs the excluding path.
+        self._sequential_offload_enabled = cfg.sequential_offload_enabled
 
         # Validate the GGUF up front, not at stage-1 load time -- a typo here
         # would otherwise surface only after the generator config is built.
@@ -456,7 +459,15 @@ class InferenceEngine:
             self._move(self.audio_vae.encoder, "cpu")
             self._move(self.audio_vae.decoder, "cpu")
             self._move(self.audio_vae.vocoder, "cpu")
-            self._move(self.generator, self.device)
+            if self._sequential_offload_enabled:
+                # A blanket .to(device) would recurse into the offloaded blocks too,
+                # dragging all 48 back onto GPU before any per-block hook gets a
+                # chance to run -- exactly the bug this branch exists to avoid.
+                from ltx_core.model.transformer.sequential_offload import move_excluding_blocks
+
+                move_excluding_blocks(self.generator, self.device)
+            else:
+                self._move(self.generator, self.device)
             self._empty()
         self._log_stage("stage_for_denoise", _swap)
 
