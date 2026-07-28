@@ -250,7 +250,15 @@ class InferenceEngine:
         Returns: {prompt_file: [cond_dict_on_cpu, ...]}
         """
         if self._gemma_gguf_path is not None:
-            print(f"[Stage 1] Loading text encoder from GGUF (NF4): {self._gemma_gguf_path.name}", flush=True)
+            # Print the configured name, not self._gemma_gguf_path.name -- that one is
+            # .resolve()d, and for a HuggingFace cache path that follows the snapshot
+            # symlink down to blobs/<sha256>, logging an opaque hash instead of the
+            # filename. The resolved path is still what actually gets read.
+            print(
+                f"[Stage 1] Loading text encoder from GGUF (NF4): "
+                f"{Path(self.cfg.gemma_gguf_path).name}",
+                flush=True,
+            )
             text_encoder = create_text_encoder_wrapper_from_gguf(
                 gguf_path=str(self._gemma_gguf_path),
                 checkpoint_path=str(self._checkpoint),

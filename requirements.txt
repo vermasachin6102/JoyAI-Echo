@@ -25,6 +25,10 @@ triton==3.4.0
 transformers==4.57.6
 safetensors==0.6.2
 bitsandbytes>=0.43  # NF4 quantization for the GGUF text-encoder loader (L4-class GPUs)
+gguf>=0.10          # reads the Q4_0 GGUF text-encoder checkpoint. Listed here rather
+                    # than installed separately with --no-deps (as the test notebook
+                    # did): its only risky transitive dep is numpy, which the pin below
+                    # constrains, and pip resolves this whole file in one pass.
 
 # --- numerical / utilities ---
 numpy>=2.0,<2.1  # numpy 2.1+ wheels ship a broken numpy._core.strings/umath pairing --
