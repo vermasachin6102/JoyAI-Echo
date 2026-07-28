@@ -34,7 +34,10 @@ from ltx_distillation.inference.memory_multishot import (
     video_uint8_to_pil_frames,
 )
 from ltx_distillation.models.ltx_wrapper import create_ltx2_wrapper
-from ltx_distillation.models.text_encoder_wrapper import create_text_encoder_wrapper
+from ltx_distillation.models.text_encoder_wrapper import (
+    create_text_encoder_wrapper,
+    create_text_encoder_wrapper_from_gguf,
+)
 from ltx_distillation.models.vae_wrapper import create_vae_wrappers
 from ltx_distillation.utils import (
     add_noise,
@@ -96,6 +99,14 @@ class InferenceConfig:
         # Paths
         self.checkpoint = str(_resolve_path(paths_cfg.get("checkpoint", "checkpoints/echo-longvideo-release.safetensors"), REPO_ROOT))
         self.gemma_path = str(_resolve_path(paths_cfg.get("gemma_path", "checkpoints/gemma-3-12b"), REPO_ROOT))
+        # Optional: path to a language-model-only Gemma3 GGUF (e.g. Q4_0). When
+        # set, stage 1 sources the Gemma LLM's weights from it and requantizes
+        # to NF4 on GPU (~13GB peak) instead of loading the full bf16
+        # safetensors (~24GB, OOMs on 24GB-class GPUs like L4). gemma_path is
+        # still required either way -- the tokenizer/processor files come from
+        # there, not from the GGUF.
+        _gguf = paths_cfg.get("gemma_gguf_path", None)
+        self.gemma_gguf_path = str(_resolve_path(_gguf, REPO_ROOT)) if _gguf else None
         self.prompts_dir = str(_resolve_path(paths_cfg.get("prompts_dir", "prompts"), REPO_ROOT))
         self.prompts_glob = paths_cfg.get("prompts_glob", "*.json")
         self.output_root = str(_resolve_path(paths_cfg.get("output_root", "inference_result/dmd"), REPO_ROOT))
@@ -197,6 +208,15 @@ class InferenceEngine:
         self._checkpoint = checkpoint
         self._gemma_path = gemma_path
 
+        # Validate the GGUF up front, not at stage-1 load time -- a typo here
+        # would otherwise surface only after the generator config is built.
+        self._gemma_gguf_path: Path | None = None
+        if cfg.gemma_gguf_path:
+            gguf_path = Path(cfg.gemma_gguf_path).expanduser().resolve()
+            if not gguf_path.exists():
+                raise FileNotFoundError(f"Gemma GGUF not found: {gguf_path}")
+            self._gemma_gguf_path = gguf_path
+
         # Stage-2 modules — populated by load_generator().
         self.generator = None
         self.video_vae = None
@@ -229,13 +249,23 @@ class InferenceEngine:
 
         Returns: {prompt_file: [cond_dict_on_cpu, ...]}
         """
-        print(f"[Stage 1] Loading text encoder...", flush=True)
-        text_encoder = create_text_encoder_wrapper(
-            checkpoint_path=str(self._checkpoint),
-            gemma_path=str(self._gemma_path),
-            device=self.device,
-            dtype=self.dtype,
-        )
+        if self._gemma_gguf_path is not None:
+            print(f"[Stage 1] Loading text encoder from GGUF (NF4): {self._gemma_gguf_path.name}", flush=True)
+            text_encoder = create_text_encoder_wrapper_from_gguf(
+                gguf_path=str(self._gemma_gguf_path),
+                checkpoint_path=str(self._checkpoint),
+                gemma_root=str(self._gemma_path),
+                device=self.device,
+                dtype=self.dtype,
+            )
+        else:
+            print(f"[Stage 1] Loading text encoder...", flush=True)
+            text_encoder = create_text_encoder_wrapper(
+                checkpoint_path=str(self._checkpoint),
+                gemma_path=str(self._gemma_path),
+                device=self.device,
+                dtype=self.dtype,
+            )
         text_encoder.eval()
 
         cached: dict[Path, list[dict[str, Any]]] = {}
@@ -792,6 +822,10 @@ def parse_args():
     parser.add_argument("--num-fix-frames", type=int, default=None)
     parser.add_argument("--enable-audio-memory", type=str_to_bool, default=None)
     parser.add_argument("--seed-video", type=str, default=None, help="Path to seed video (.mp4) for memory bank")
+    parser.add_argument(
+        "--gemma-gguf-path", type=str, default=None,
+        help="Language-model-only Gemma3 GGUF (e.g. Q4_0). Cuts text-encoder VRAM ~24GB -> ~13GB via NF4.",
+    )
     return parser.parse_args()
 
 
@@ -816,6 +850,8 @@ def main() -> None:
         cli_overrides["output_root"] = str(Path(args.output_root).expanduser().resolve())
     if args.seed_video:
         cli_overrides["seed_video"] = str(Path(args.seed_video).expanduser().resolve())
+    if args.gemma_gguf_path:
+        cli_overrides["gemma_gguf_path"] = str(Path(args.gemma_gguf_path).expanduser().resolve())
 
     cfg = InferenceConfig(config_path, **cli_overrides)
 

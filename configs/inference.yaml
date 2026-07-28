@@ -17,6 +17,13 @@ env:
 paths:
   checkpoint: checkpoints/test.safetensors
   gemma_path: checkpoints/gemma-3-12b
+  # Optional: language-model-only Gemma3 GGUF (e.g. Q4_0). Set this to cut the
+  # text encoder's peak VRAM from ~24GB (full bf16, OOMs on 24GB-class GPUs) to
+  # ~13GB by requantizing to NF4 on load. gemma_path above is still required --
+  # tokenizer/processor files come from there, not from the GGUF.
+  # Quality note: NF4 is a different scheme than the GGUF's QAT-trained Q4_0,
+  # so some of that QAT-specific quality benefit is traded away.
+  # gemma_gguf_path: checkpoints/gemma-3-12b-it-q4_0.gguf
   prompts_dir: prompts
   prompts_glob: "*.json"
   output_root: inference_result/outputs
