@@ -826,6 +826,10 @@ def parse_args():
         "--gemma-gguf-path", type=str, default=None,
         help="Language-model-only Gemma3 GGUF (e.g. Q4_0). Cuts text-encoder VRAM ~24GB -> ~13GB via NF4.",
     )
+    parser.add_argument(
+        "--quantization-fp8-enabled", type=str_to_bool, default=None,
+        help="FP8-downcast the generator's linear weights (stage 2). Roughly halves its ~36.5GB bf16 footprint.",
+    )
     return parser.parse_args()
 
 
@@ -838,7 +842,8 @@ def main() -> None:
 
     cli_overrides = {}
     for key in ["seed", "num_frames", "video_height", "video_width", "video_fps",
-                "v2a_grad_scale", "memory_max_size", "num_fix_frames", "enable_audio_memory"]:
+                "v2a_grad_scale", "memory_max_size", "num_fix_frames", "enable_audio_memory",
+                "quantization_fp8_enabled"]:
         val = getattr(args, key, None)
         if val is not None:
             cli_overrides[key] = val
