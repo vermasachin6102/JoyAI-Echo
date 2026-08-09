@@ -29,6 +29,9 @@ that QAT-specific quality benefit for actually fitting in 22GB.
 
 from __future__ import annotations
 
+import os
+import time
+
 import torch
 
 from ltx_core.text_encoders.gemma.encoders.base_encoder import (
@@ -40,6 +43,12 @@ from ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
     GemmaTextEncoderConfigurator,
 )
 from ltx_core.text_encoders.gemma.gguf_loader import iter_gemma_gguf_tensors
+from ltx_core.text_encoders.gemma.nf4_cache import (
+    DequantCacheWriter,
+    default_cache_dir,
+    gguf_sha256,
+    load_dequant_cache,
+)
 
 
 def _assign_tensor(
@@ -116,15 +125,53 @@ def build_gemma_text_encoder_from_gguf(
     inner.model.vision_tower = None
     inner.model.multi_modal_projector = None
 
-    # Stream tensors one at a time: dequantize, assign (quantizing Linear
-    # weights to NF4 on GPU immediately), then drop the CPU bf16 copy before
-    # the next tensor is even read. Never materializes the full ~24GB model
-    # in system RAM the way a batch load_state_dict would.
+    # Dequant cache: the GGUF Q4_0->bf16 decode is a deterministic transform
+    # of the file's bytes, recomputed from scratch on every process start
+    # (measured: ~211-233s, see nf4_cache.py docstring). Caches
+    # iter_gemma_gguf_tensors' own output and replays it through the same
+    # _assign_tensor used by the live path below -- no separate code path to
+    # get wrong. NF4_CACHE_DISABLE=1 bypasses this entirely (debugging /
+    # re-verifying the cache still matches a fresh build).
+    cache_disabled = os.environ.get("NF4_CACHE_DISABLE", "") == "1"
+    cache_dir = default_cache_dir(gguf_path)
+    gguf_hash = None
+    cached_tensors = None
+    if not cache_disabled:
+        t0 = time.perf_counter()
+        gguf_hash = gguf_sha256(gguf_path)
+        hash_s = time.perf_counter() - t0
+        cached_tensors = load_dequant_cache(cache_dir, gguf_hash)
+        if cached_tensors is not None:
+            print(f"[DequantCache] hash check {hash_s:.1f}s, cache HIT", flush=True)
+
+    t0 = time.perf_counter()
     tensor_count = 0
-    for final_key, tensor in iter_gemma_gguf_tensors(gguf_path, dtype=dtype):
-        _assign_tensor(text_encoder, final_key, tensor, device=device, dtype=dtype)
-        tensor_count += 1
-    print(f"[GemmaGGUF] loaded {tensor_count} tensors", flush=True)
+    if cached_tensors is not None:
+        for final_key, tensor in cached_tensors:
+            _assign_tensor(text_encoder, final_key, tensor, device=device, dtype=dtype)
+            tensor_count += 1
+        print(f"[DequantCache] replayed {tensor_count} tensors in {time.perf_counter()-t0:.1f}s", flush=True)
+    else:
+        # Stream tensors one at a time: dequantize, assign (quantizing Linear
+        # weights to NF4 on GPU immediately), then drop the CPU bf16 copy before
+        # the next tensor is even read. Never materializes the full ~24GB model
+        # in system RAM the way a batch load_state_dict would -- writing each
+        # tensor to its own cache file as it streams by preserves that same
+        # one-tensor-at-a-time peak, unlike accumulating a dict to save at the end.
+        writer = None if cache_disabled else DequantCacheWriter(cache_dir, gguf_hash)
+        for final_key, tensor in iter_gemma_gguf_tensors(gguf_path, dtype=dtype):
+            if writer is not None:
+                writer.add(final_key, tensor)
+            _assign_tensor(text_encoder, final_key, tensor, device=device, dtype=dtype)
+            tensor_count += 1
+        print(f"[GemmaGGUF] loaded {tensor_count} tensors in {time.perf_counter()-t0:.1f}s", flush=True)
+        if writer is not None:
+            try:
+                writer.finalize()
+            except Exception as e:
+                # Cache is an optimization, not a correctness dependency -- a
+                # failed save should never take down an otherwise-successful build.
+                print(f"[DequantCache] save failed ({e!r}), continuing without cache", flush=True)
 
     # embed_scale / rotary inv_freq buffers aren't GGUF tensors -- they're
     # created by GEMMA_MODEL_OPS.mutator above and never touched by

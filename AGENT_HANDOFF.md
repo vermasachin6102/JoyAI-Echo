@@ -17,8 +17,10 @@ is measured, not guessed, unless explicitly flagged as unverified.
 1. Do **not** re-run recon. The pipeline is mapped and profiled. Numbers in §2.
 2. The two "obvious" wins are **disproved** — offload removal OOMs, attention
    is already near hardware limit. Don't repeat that work (§4).
-3. Highest-value untried item: **native fp8 GEMM already exists in this repo
-   and is unused** (§3, item 2). Second: **NF4 cache** (§3, item 1).
+3. **Dequant cache is landed** (§3 item 1) — real but modest, ~3% of run
+   (not the ~17% originally estimated, see §3.1 for why). Highest-value
+   UNTRIED item: **native fp8 GEMM already exists in this repo and is
+   unused** (§3, item 2).
 4. Getting a Colab session to survive is genuinely hard here. Read
    COLAB_CLI_HANDOFF.md §"CRITICAL: session lifetime" before you burn an hour
    like I did.
@@ -102,14 +104,37 @@ GPU 84% busy ⇒ ~15 s/step of launch gaps.
 
 ## 3. GENUINE remaining work, ranked
 
-### 1. NF4 quantization cache (stage 1) — ~17% of run, ZERO risk
-211 s recomputing a deterministic transform of fixed input files, every run.
-Serialize the bitsandbytes NF4 state dict + quant state after first build;
-key the cache on a hash of the source GGUF so a changed input invalidates.
-Output is **bit-identical** — no quality gate needed, just hash-compare the
-reconstructed tensors against a fresh dequant once.
-Code: `ltx-core/src/ltx_core/text_encoders/gemma/gguf_builder.py`
-(`_assign_tensor` / `build_gemma_text_encoder_from_gguf`).
+### 1. Dequant cache (stage 1) — LANDED 2026-08-09, ~3% of run, ZERO risk
+**Done, not just proposed.** `ltx-core/src/ltx_core/text_encoders/gemma/nf4_cache.py`
++ `gguf_builder.py`. Verified bit-identical (all 626 tensors) and a smoke
+test (real `encode()` call, no NaN/Inf) via `benchmarks/verify_nf4_cache.py`.
+
+**Correcting this section's own original estimate** (~17% projected): the
+real number is ~3% of total run time, not ~17%. Two things were wrong in the
+original plan:
+1. First implementation cached bitsandbytes' *already-NF4-quantized* state
+   directly (packed weight bytes + `QuantState`), with hand-rolled
+   module-tree replacement logic. Hit two distinct bugs in that replacement
+   logic on live testing (wrong `setattr` target for "plain" tensors; a
+   navigation error for per-layer norms). Rewritten to cache the
+   *dequantized bf16* tensors instead and replay them through the
+   already-proven `_assign_tensor` — zero new tree-navigation code, but
+   this means NF4 requantization still happens on every load.
+2. Measured: GGUF Q4_0→bf16 decode was NOT the dominant cost as assumed.
+   Fresh build 226.0s; cached replay 187.1s (26.9s hash-check + 158.4s
+   replaying 626 tensors through `_assign_tensor`, i.e. still doing NF4
+   quantization every time). Real saving: **38.8s, ~1.2x, ~3% of a ~20min
+   run** — not the ~17% originally estimated before this was measured.
+
+Real remaining opportunity if this is revisited: cache the NF4-quantized
+state itself (skip requantization too, not just the GGUF decode) — that's
+what the first, buggy implementation attempted. The bugs were in
+reimplemented module-tree navigation, not in the caching concept; a careful
+redo reusing more of bitsandbytes' own save/load primitives (rather than
+manually reconstructing `Params4bit`/`QuantState`) could plausibly still
+reach the original ~17% estimate. Not attempted again this round — two
+failed attempts at that design was the point to fall back to something
+simpler and get *a* verified win landed rather than none.
 
 ### 2. Native fp8 GEMM — ALREADY IN THE REPO, UNUSED — ~20% of step
 **The most interesting finding.** `QuantizationPolicy.fp8_scaled_mm()`
@@ -193,18 +218,35 @@ there's nothing to *tune*. Full quality gate required.
 5. **`subprocess.run(capture_output=True)` buffers everything** until exit —
    a running job looks identical to a hang. Use `Popen` + line-streaming.
    (`benchmarks/run_eval.py` still has this bug.)
+6. **`del model; torch.cuda.empty_cache()` doesn't guarantee memory is freed.**
+   A reference cycle (common in nn.Module graphs) can keep the refcount above
+   zero past `del`; `empty_cache()` only releases what's already been freed
+   by the allocator, it doesn't force collection. Add `gc.collect()` between
+   them. Cost a live OOM to discover in an A/B harness holding two model
+   instances sequentially (not a real pipeline pattern, but any verification
+   script doing before/after comparisons in one process will hit this).
+7. **Calling `.encode()`/`.forward()` directly in a test script without
+   `torch.no_grad()` will build a full autograd graph and can OOM a model
+   that fits fine in production.** The real pipeline's
+   `GemmaTextEncoderWrapper.forward()` is `@torch.no_grad()`-decorated;
+   calling the inner `.encode()` directly (e.g. in a verification/profiling
+   script) bypasses that protection silently. Wrap any ad-hoc forward call
+   in `with torch.no_grad():` explicitly, don't assume it's inherited.
 
 ---
 
-## 6. Assets in this repo (all uncommitted as of handoff)
+## 6. Assets in this repo
 
-| file | what |
-|------|------|
-| `NOTES.md` | raw findings, dead ends with reasoning, corrections |
-| `REPORT.md` | baseline, profile, hypotheses tested, recommendation |
-| `COLAB_CLI_HANDOFF.md` | Colab CLI usage, session-lifetime root cause, HF token setup |
-| `benchmarks/profile_step.py` | one-step profiler (works; produced §2) |
-| `benchmarks/ab_compile.py` | in-process A/B harness, one model load for both arms |
+| file | what | status |
+|------|------|--------|
+| `NOTES.md` | raw findings, dead ends with reasoning, corrections | uncommitted |
+| `REPORT.md` | baseline, profile, hypotheses tested, recommendation | uncommitted |
+| `COLAB_CLI_HANDOFF.md` | Colab CLI usage, session-lifetime root cause, HF token setup | uncommitted |
+| `ltx-core/.../gemma/nf4_cache.py` | dequant cache, §3.1 | **committed, landed** |
+| `ltx-core/.../gemma/gguf_builder.py` | wired to use the cache | **committed, landed** |
+| `benchmarks/verify_nf4_cache.py` | cache correctness test (bit-identical + smoke) | committed |
+| `benchmarks/profile_step.py` | one-step profiler (works; produced §2) | uncommitted |
+| `benchmarks/ab_compile.py` | in-process A/B harness, one model load for both arms | uncommitted |
 | `benchmarks/quality_metrics.py` | PSNR/SSIM/LPIPS/LSD/MCD/SI-SDR, self-tested |
 | `benchmarks/run_eval.py` | eval-set runner — **has the buffering bug, and reloads the model per job. Rewrite before use.** |
 | `scratch_*.py`, `scratch_*.sh` | Colab driver scripts (setup, launch, tail) |
@@ -220,13 +262,17 @@ gating those.
 ## 7. Suggested order for the next agent
 
 1. Get a session alive (§1). Verify with `colab sessions` that nothing else runs.
-2. Land the **NF4 cache** (§3.1). Safe, certain, ~17%. Verify by hash.
+2. ~~Land the NF4 cache~~ — **done** (§3.1), ~3% not ~17%, see the correction there.
 3. Instrument **stage 2** (§3.3). 134 s is unexamined; may be another easy cache.
 4. Build the **quality harness + noise floor** (needed for anything below).
 5. Attempt **native fp8 GEMM** (§3.2). Biggest software lever. Expect to fight
    `tensorrt_llm` install and calibration-scale plumbing; the existing call
    site is stale so treat it as new work, not a config flip.
-6. Re-profile and re-plan from whatever dominates then.
+6. If more stage-1 saving is wanted: redo the NF4-state cache (skip
+   requantization too), reusing bitsandbytes' own save/load primitives
+   instead of hand-rolled module-tree replacement — see §3.1's note on why
+   the first attempt at this specific approach failed twice.
+7. Re-profile and re-plan from whatever dominates then.
 
 Be honest in the report about what did not work. Most of the value in this
 handoff is the disproved hypotheses in §4 — they are what stops the next

@@ -47,14 +47,15 @@ else:
     os.symlink(c[0], dst_test)
     print("Echo ->", os.path.realpath(dst_test))
 
-# Tokenizer/config files ONLY -- module_ops_from_gemma_root reads just
-# tokenizer.model + preprocessor_config.json; the 24GB of safetensors shards
-# are never touched on the GGUF path. Verified by reading base_encoder.py.
-print("Gemma tokenizer/config files only (NOT the 24GB shards)...")
-gemma_dir = snapshot_download(
-    repo_id="google/gemma-3-12b-it",
-    allow_patterns=["*.json", "*.model", "*.txt"],
-)
+# FULL snapshot, including the .safetensors shards. Tokenizer-only looks
+# sufficient (module_ops_from_gemma_root reads just tokenizer.model +
+# preprocessor_config.json) but ModelLedger.build_model_builders globs
+# model*.safetensors UNCONDITIONALLY whenever gemma_root_path is set --
+# including from create_ltx2_wrapper, which never touches .text_encoder().
+# Confirmed by hitting this exact FileNotFoundError once already this
+# session on a tokenizer-only download. See AGENT_HANDOFF.md section 5.
+print("Gemma full snapshot (shards required by ModelLedger, not by the GGUF path itself)...")
+gemma_dir = snapshot_download(repo_id="google/gemma-3-12b-it")
 dst_gemma = "/content/JoyAI-Echo/checkpoints/gemma-3-12b"
 if os.path.islink(dst_gemma): os.remove(dst_gemma)
 elif os.path.isdir(dst_gemma): shutil.rmtree(dst_gemma)
