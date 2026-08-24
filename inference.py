@@ -37,6 +37,7 @@ from ltx_distillation.models.ltx_wrapper import create_ltx2_wrapper
 from ltx_distillation.models.text_encoder_wrapper import (
     create_text_encoder_wrapper,
     create_text_encoder_wrapper_from_gguf,
+    create_text_encoder_wrapper_from_safetensors_nf4,
 )
 from ltx_distillation.models.vae_wrapper import create_vae_wrappers
 from ltx_distillation.utils import (
@@ -107,6 +108,15 @@ class InferenceConfig:
         # there, not from the GGUF.
         _gguf = paths_cfg.get("gemma_gguf_path", None)
         self.gemma_gguf_path = str(_resolve_path(_gguf, REPO_ROOT)) if _gguf else None
+        # Alternative to the GGUF path: NF4-quantize directly from gemma_path's
+        # bf16 safetensors, no separate GGUF file needed. Faster stage-1 load
+        # (no CPU-bound GGUF decode) and more accurate (one bf16->NF4
+        # quantization pass instead of the GGUF path's bf16->Q4_0->bf16->NF4).
+        # UNVERIFIED end-to-end as of introduction -- see
+        # create_text_encoder_wrapper_from_safetensors_nf4's docstring before
+        # trusting this over --gemma-gguf-path for anything that matters.
+        # Mutually exclusive with gemma_gguf_path; GGUF wins if both are set.
+        self.gemma_safetensors_nf4_enabled = bool(paths_cfg.get("gemma_safetensors_nf4_enabled", False))
         self.prompts_dir = str(_resolve_path(paths_cfg.get("prompts_dir", "prompts"), REPO_ROOT))
         self.prompts_glob = paths_cfg.get("prompts_glob", "*.json")
         self.output_root = str(_resolve_path(paths_cfg.get("output_root", "inference_result/dmd"), REPO_ROOT))
@@ -272,6 +282,20 @@ class InferenceEngine:
             )
             text_encoder = create_text_encoder_wrapper_from_gguf(
                 gguf_path=str(self._gemma_gguf_path),
+                checkpoint_path=str(self._checkpoint),
+                gemma_root=str(self._gemma_path),
+                device=self.device,
+                dtype=self.dtype,
+            )
+        elif self.cfg.gemma_safetensors_nf4_enabled:
+            # UNVERIFIED end-to-end as of introduction -- see
+            # create_text_encoder_wrapper_from_safetensors_nf4's docstring.
+            print(
+                "[Stage 1] Loading text encoder, NF4 direct from bf16 safetensors "
+                "(no GGUF) -- UNVERIFIED path, confirm output before trusting",
+                flush=True,
+            )
+            text_encoder = create_text_encoder_wrapper_from_safetensors_nf4(
                 checkpoint_path=str(self._checkpoint),
                 gemma_root=str(self._gemma_path),
                 device=self.device,
@@ -876,6 +900,11 @@ def parse_args():
         "--sequential-offload-enabled", type=str_to_bool, default=None,
         help="Stream transformer blocks CPU->GPU one at a time, freeing ~17GB of weights for activations.",
     )
+    parser.add_argument(
+        "--gemma-safetensors-nf4-enabled", type=str_to_bool, default=None,
+        help="NF4-quantize the text encoder directly from bf16 safetensors, no GGUF file needed. "
+             "UNVERIFIED end-to-end -- ignored if --gemma-gguf-path is also set (GGUF wins).",
+    )
     return parser.parse_args()
 
 
@@ -889,7 +918,8 @@ def main() -> None:
     cli_overrides = {}
     for key in ["seed", "num_frames", "video_height", "video_width", "video_fps",
                 "v2a_grad_scale", "memory_max_size", "num_fix_frames", "enable_audio_memory",
-                "quantization_fp8_enabled", "sequential_offload_enabled"]:
+                "quantization_fp8_enabled", "sequential_offload_enabled",
+                "gemma_safetensors_nf4_enabled"]:
         val = getattr(args, key, None)
         if val is not None:
             cli_overrides[key] = val

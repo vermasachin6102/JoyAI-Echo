@@ -186,3 +186,51 @@ def create_text_encoder_wrapper_from_gguf(
         device=device,
         dtype=dtype,
     )
+
+
+def create_text_encoder_wrapper_from_safetensors_nf4(
+    checkpoint_path: str,
+    gemma_root: str,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+    registry: Registry | None = None,
+) -> GemmaTextEncoderWrapper:
+    """Same as create_text_encoder_wrapper_from_gguf, but sources NF4 weights
+    directly from gemma_root's bf16 safetensors instead of a separate GGUF
+    file -- see ltx_core.text_encoders.gemma.safetensors_nf4_builder for
+    scope and details, and safetensors_loader.py for why this exists (no
+    GGUF download, no CPU-bound dequant, more accurate: single bf16->NF4
+    quantization pass instead of the GGUF path's bf16->Q4_0->bf16->NF4).
+
+    UNVERIFIED end-to-end as of introduction -- built and syntax-checked,
+    not yet run against a live checkpoint. Do not treat as a drop-in
+    replacement for the GGUF path until confirmed: real encode() output,
+    no NaN/Inf, and a side-by-side comparison against the GGUF path's
+    output (expect close but NOT bit-identical -- this path is meant to be
+    MORE accurate, so "different" is the correct outcome, not a bug).
+    """
+    from ltx_core.text_encoders.gemma.safetensors_nf4_builder import (
+        build_gemma_text_encoder_from_safetensors_nf4,
+    )
+    from ltx_pipelines.utils.model_ledger import ModelLedger
+
+    text_encoder = build_gemma_text_encoder_from_safetensors_nf4(
+        gemma_root=gemma_root,
+        device=device,
+        dtype=dtype,
+    )
+
+    ledger = ModelLedger(
+        dtype=dtype,
+        device=torch.device("cpu"),
+        checkpoint_path=checkpoint_path,
+        registry=registry,
+    )
+    embeddings_processor = ledger.gemma_embeddings_processor().to(device=device, dtype=dtype)
+
+    return GemmaTextEncoderWrapper(
+        text_encoder=text_encoder,
+        embeddings_processor=embeddings_processor,
+        device=device,
+        dtype=dtype,
+    )
